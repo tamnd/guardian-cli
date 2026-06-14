@@ -16,158 +16,172 @@ import (
 //
 // exactly as a database/sql program enables a driver with `import _
 // "github.com/lib/pq"`. The init below registers it; the host then dereferences
-// guardian:// URIs by routing to the operations Register installs. The same
-// Domain also builds the standalone guardian binary (see cli.NewApp), so the
-// binary and a host share one source of truth.
-//
-// This is the scaffold's starting point: one resource type, "page", served by a
-// resolver op and a list op. Add your real types here as you model the site.
+// guardian:// URIs by routing to the operations Register installs.
 func init() { kit.Register(Domain{}) }
 
 // Domain is the guardian driver. It carries no state; the per-run client is
 // built by the factory Register hands kit.
 type Domain struct{}
 
-// Info describes the scheme, the hostnames a pasted link is matched against, and
-// the identity reused for the binary's help and version.
+// Info describes the scheme, the hostnames a pasted link is matched against,
+// and the identity reused for the binary's help and version.
 func (Domain) Info() kit.DomainInfo {
 	return kit.DomainInfo{
 		Scheme: "guardian",
 		Hosts:  []string{Host},
 		Identity: kit.Identity{
 			Binary: "guardian",
-			Short:  "A command line for guardian.",
-			Long: `A command line for guardian.
+			Short:  "A command line for The Guardian newspaper.",
+			Long: `A command line for The Guardian newspaper.
 
-guardian reads public guardian data over plain HTTPS, shapes it into
-clean records, and prints output that pipes into the rest of your tools. No API
-key, nothing to run alongside it.`,
-			Site: Host,
+guardian reads public Guardian content via the open API (api-key=test),
+shapes it into clean records, and prints output that pipes into the rest of
+your tools. No account required — the test key is officially supported.`,
+			Site: "www.theguardian.com",
 			Repo: "https://github.com/tamnd/guardian-cli",
 		},
 	}
 }
 
-// Register installs the client factory and every operation onto app. A resolver
-// op (Single) names its own record type and answers `ant get`; a List op
-// enumerates a parent resource's members and answers `ant ls`.
+// Register installs the client factory and every operation onto app.
 func (Domain) Register(app *kit.App) {
 	app.SetClient(newClient)
 
-	// Resolver op: one record per id, the home of `guardian page` and
-	// `ant get guardian://page/<id>`.
-	kit.Handle(app, kit.OpMeta{Name: "page", Group: "read", Single: true,
-		Summary: "Fetch a page by path or URL", URIType: "page", Resolver: true,
-		Args: []kit.Arg{{Name: "ref", Help: "page path or URL"}}}, getPage)
+	kit.Handle(app, kit.OpMeta{
+		Name:    "search",
+		Group:   "read",
+		List:    true,
+		Summary: "Search Guardian articles",
+		Args:    []kit.Arg{{Name: "query", Help: "search query"}},
+	}, searchArticles)
 
-	// List op: members of a page, the home of `guardian links` and `ant ls`.
-	// It emits page stubs, so every listed member is itself an addressable
-	// guardian://page/ URI a host can follow.
-	kit.Handle(app, kit.OpMeta{Name: "links", Group: "read", List: true,
-		Summary: "List the pages a page links to", URIType: "page",
-		Args: []kit.Arg{{Name: "ref", Help: "page path or URL"}}}, listLinks)
+	kit.Handle(app, kit.OpMeta{
+		Name:    "sections",
+		Group:   "read",
+		List:    true,
+		Summary: "List all Guardian sections",
+	}, listSections)
+
+	kit.Handle(app, kit.OpMeta{
+		Name:    "tags",
+		Group:   "read",
+		List:    true,
+		Summary: "Browse Guardian tags",
+	}, listTags)
 }
 
-// newClient builds the client from the host-resolved config, so a host and the
-// standalone binary pace and identify themselves the same way.
+// newClient builds the client from the host-resolved config.
 func newClient(_ context.Context, cfg kit.Config) (any, error) {
-	c := NewClient()
+	dcfg := DefaultConfig()
 	if cfg.UserAgent != "" {
-		c.UserAgent = cfg.UserAgent
+		dcfg.UserAgent = cfg.UserAgent
 	}
 	if cfg.Rate > 0 {
-		c.Rate = cfg.Rate
+		dcfg.Rate = cfg.Rate
 	}
 	if cfg.Retries > 0 {
-		c.Retries = cfg.Retries
+		dcfg.Retries = cfg.Retries
 	}
 	if cfg.Timeout > 0 {
-		c.HTTP.Timeout = cfg.Timeout
+		dcfg.Timeout = cfg.Timeout
 	}
-	return c, nil
+	return NewClientWithConfig(dcfg), nil
 }
 
 // --- inputs ---
-//
-// Each handler takes a typed input struct. kit fills the fields from the tags:
-// kit:"arg" is a positional argument, kit:"flag,inherit" binds the framework's
-// shared flag of the same name, and kit:"inject" receives the client newClient
-// builds.
 
-type pageRef struct {
-	Ref    string  `kit:"arg" help:"page path or URL"`
+type searchInput struct {
+	Query   string  `kit:"arg"          help:"search query"`
+	Section string  `kit:"flag"         help:"section filter (technology, science, politics, sport, culture, world)"`
+	From    string  `kit:"flag"         help:"from date (YYYY-MM-DD)"`
+	To      string  `kit:"flag"         help:"to date (YYYY-MM-DD)"`
+	Limit   int     `kit:"flag,inherit" help:"max results"`
+	Client  *Client `kit:"inject"`
+}
+
+type sectionsInput struct {
 	Client *Client `kit:"inject"`
 }
 
-type listRef struct {
-	Ref    string  `kit:"arg" help:"page path or URL"`
-	Limit  int     `kit:"flag,inherit" help:"max results"`
-	Client *Client `kit:"inject"`
+type tagsInput struct {
+	Section string  `kit:"flag"         help:"filter tags by section"`
+	Limit   int     `kit:"flag,inherit" help:"max results"`
+	Client  *Client `kit:"inject"`
 }
 
 // --- handlers ---
 
-func getPage(ctx context.Context, in pageRef, emit func(*Page) error) error {
-	p, err := in.Client.GetPage(ctx, pagePath(in.Ref))
+func searchArticles(ctx context.Context, in searchInput, emit func(*Article) error) error {
+	articles, err := in.Client.SearchArticles(ctx, in.Query, in.Section, in.From, in.To, in.Limit)
 	if err != nil {
-		return mapErr(err)
+		return err
 	}
-	return emit(p)
-}
-
-func listLinks(ctx context.Context, in listRef, emit func(*Page) error) error {
-	pages, err := in.Client.PageLinks(ctx, pagePath(in.Ref), in.Limit)
-	if err != nil {
-		return mapErr(err)
-	}
-	for _, p := range pages {
-		if err := emit(p); err != nil {
+	for i := range articles {
+		if err := emit(&articles[i]); err != nil {
 			return err
 		}
 	}
 	return nil
 }
 
-// --- Resolver: the URI-native string functions, pure and network-free ---
-
-// Classify turns any accepted input — a bare path or a full guardian.com URL —
-// into the canonical (type, id), so `ant resolve` and `ant url` touch no network.
-func (Domain) Classify(input string) (uriType, id string, err error) {
-	id = pagePath(input)
-	if id == "" {
-		return "", "", errs.Usage("unrecognized guardian reference: %q", input)
+func listSections(ctx context.Context, in sectionsInput, emit func(*Section) error) error {
+	sections, err := in.Client.ListSections(ctx)
+	if err != nil {
+		return err
 	}
-	return "page", id, nil
+	for i := range sections {
+		if err := emit(&sections[i]); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func listTags(ctx context.Context, in tagsInput, emit func(*Tag) error) error {
+	tags, err := in.Client.ListTags(ctx, in.Section, in.Limit)
+	if err != nil {
+		return err
+	}
+	for i := range tags {
+		if err := emit(&tags[i]); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// --- Resolver: pure string functions, network-free ---
+
+// Classify turns any accepted input into a canonical (type, id).
+// - "technology/2024/abc" (contains "/") → ("article", id)
+// - "technology" (single token) → ("section", id)
+// - "climate change" (contains space) → ("query", q)
+func (Domain) Classify(input string) (uriType, id string, err error) {
+	input = strings.TrimSpace(input)
+	if input == "" {
+		return "", "", errs.Usage("empty guardian reference")
+	}
+	// Strip known guardian web URL prefix
+	if u, e := url.Parse(input); e == nil && (u.Scheme == "http" || u.Scheme == "https") {
+		input = strings.Trim(u.Path, "/")
+	}
+	if strings.Contains(input, "/") {
+		return "article", input, nil
+	}
+	if strings.Contains(input, " ") {
+		return "query", input, nil
+	}
+	return "section", input, nil
 }
 
 // Locate is the inverse: the live https URL for a (type, id).
 func (Domain) Locate(uriType, id string) (string, error) {
-	if uriType != "page" {
+	switch uriType {
+	case "article", "section":
+		return "https://www.theguardian.com/" + strings.Trim(id, "/"), nil
+	case "query":
+		return "https://www.theguardian.com/search?q=" + url.QueryEscape(id), nil
+	default:
 		return "", errs.Usage("guardian has no resource type %q", uriType)
 	}
-	return BaseURL + "/" + strings.Trim(id, "/"), nil
-}
-
-// --- helpers ---
-
-// pagePath turns any accepted input into the canonical page id: the path of a
-// full URL on this host, or a bare path with its slashes trimmed.
-func pagePath(input string) string {
-	input = strings.TrimSpace(input)
-	if u, err := url.Parse(input); err == nil && (u.Scheme == "http" || u.Scheme == "https") {
-		return strings.Trim(u.Path, "/")
-	}
-	return strings.Trim(input, "/")
-}
-
-// mapErr converts a library error into the kit error kind that carries the right
-// exit code, so a host renders the same outcomes the standalone binary does. As
-// you add sentinel errors to the library, map them here, for example:
-//
-//	case errors.Is(err, ErrNotFound):
-//		return errs.NotFound("%s", err.Error())
-//	case errors.Is(err, ErrRateLimited):
-//		return errs.RateLimited("%s", err.Error())
-func mapErr(err error) error {
-	return err
 }
